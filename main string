@@ -1,0 +1,435 @@
+# Jupyter-ready script: predict next-quarter GDP growth and level, plus annualized growth
+# Now includes additional FRED series: FEDFUNDS, EXPGS, IMPGS, and GPDIC1
+# No seaborn dependency.
+#
+# Requirements: pandas, numpy, matplotlib, scikit-learn, requests
+# pip install pandas numpy matplotlib scikit-learn requests
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import os
+from pathlib import Path
+import requests
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+# Jupyter inline
+try:
+    get_ipython  # type: ignore
+    %matplotlib inline  # type: ignore
+except Exception:
+    pass
+
+plt.style.use("ggplot")
+
+# -------------------------
+# User config
+# -------------------------
+FRED_API_KEY = "92d97b863d0c060684a148857cfccf6b"
+DATA_DIR = Path(r"C:\Users\Liam\Desktop\New folder (2)")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Add the new series here
+SERIES = {
+    "GDPC1": "Real Gross Domestic Product (GDPC1) - Quarterly",
+    "GPDIC1": "Real Gross Private Domestic Investment (GPDIC1) - Quarterly",
+    "UNRATE": "Unemployment Rate (UNRATE) - Monthly",
+    "CPIAUCSL": "Consumer Price Index (CPIAUCSL) - Monthly",
+    "DGS10": "10-Year Treasury (DGS10) - Monthly",
+    "CUSR0000SAH1": "Housing expenditures (CUSR0000SAH1) - Monthly",
+    # New monthly series
+    "FEDFUNDS": "Effective Federal Funds Rate (FEDFUNDS) - Monthly",
+    "EXPGS": "Exports of Goods and Services (EXPGS) - Monthly",
+    "IMPGS": "Imports of Goods and Services (IMPGS) - Monthly"
+}
+
+RANDOM_STATE = 42
+MIN_TRAIN_SAMPLES = 8
+
+# -------------------------
+# Helper functions
+# -------------------------
+def fetch_fred_series(series_id: str) -> pd.Series:
+    """Fetch FRED series (or read local CSV if present) and return a pd.Series indexed by datetime."""
+    csv_path = DATA_DIR / f"{series_id}.csv"
+    if csv_path.exists():
+        df = pd.read_csv(csv_path)
+        if "observation_date" in df.columns:
+            df = df.rename(columns={c: c for c in df.columns})  # no-op to keep style
+        elif "date" in df.columns:
+            df = df.rename(columns={"date": "observation_date"})
+        df["observation_date"] = pd.to_datetime(df["observation_date"], errors="coerce")
+        if "value" in df.columns:
+            df["value"] = pd.to_numeric(df["value"].replace(".", np.nan), errors="coerce")
+            s = pd.Series(df["value"].values, index=pd.DatetimeIndex(df["observation_date"]), name=series_id)
+            return s[~s.index.duplicated(keep="first")].sort_index()
+        else:
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            if not numeric_cols:
+                raise ValueError(f"No numeric column found in {csv_path}")
+            col = numeric_cols[0]
+            s = pd.Series(df[col].values, index=pd.DatetimeIndex(df["observation_date"]), name=series_id)
+            return s[~s.index.duplicated(keep="first")].sort_index()
+
+    # fetch from FRED
+    url = "https://api.stlouisfed.org/fred/series/observations"
+    params = {"series_id": series_id, "api_key": FRED_API_KEY, "file_type": "json"}
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    obs = data.get("observations", [])
+    if not obs:
+        raise ValueError(f"No observations returned for {series_id}")
+    df = pd.DataFrame(obs)
+    if "date" in df.columns:
+        df = df.rename(columns={"date": "observation_date"})
+    if "value" in df.columns:
+        df["value"] = pd.to_numeric(df["value"].replace(".", np.nan), errors="coerce")
+    else:
+        cols = [c for c in df.columns if c != "observation_date"]
+        if not cols:
+            raise ValueError(f"No value-like column returned for {series_id}")
+        df = df.rename(columns={cols[0]: "value"})
+        df["value"] = pd.to_numeric(df["value"].replace(".", np.nan), errors="coerce")
+    df["observation_date"] = pd.to_datetime(df["observation_date"])
+    df = df.sort_values("observation_date").reset_index(drop=True)
+    df.to_csv(csv_path, index=False)
+    s = pd.Series(df["value"].values, index=pd.DatetimeIndex(df["observation_date"]), name=series_id)
+    return s[~s.index.duplicated(keep="first")].sort_index()
+
+def to_quarterly_series(s: pd.Series, source_freq: str) -> pd.Series:
+    """Convert a series to quarterly (quarter-end timestamps). source_freq: 'monthly' or 'quarterly'"""
+    if source_freq == "quarterly":
+        q = s.copy()
+        q.index = q.index.to_period("Q").to_timestamp(how="end")
+        q = q.groupby(q.index).last()
+        return q.sort_index()
+    elif source_freq == "monthly":
+        q = s.groupby(s.index.to_period("Q")).mean()
+        q.index = q.index.to_timestamp(how="end")
+        return q.sort_index()
+    else:
+        raise ValueError("source_freq must be 'monthly' or 'quarterly'")
+
+def rmse(a, b):
+    return np.sqrt(mean_squared_error(a, b))
+
+def annualize_qoq_pct(qoq_pct):
+    arr = np.array(qoq_pct, dtype=float)
+    return (np.power(1.0 + arr / 100.0, 4) - 1.0) * 100.0
+
+# -------------------------
+# Load & align data
+# -------------------------
+series_data = {}
+for sid in SERIES:
+    series_data[sid] = fetch_fred_series(sid)
+
+print("Series ranges and counts:")
+for sid, s in series_data.items():
+    print(f" - {sid}: {s.index.min().date()} to {s.index.max().date()} ({len(s)} obs)")
+
+# Define which are monthly and which are quarterly
+monthly_ids = ["UNRATE", "CPIAUCSL", "DGS10", "CUSR0000SAH1", "FEDFUNDS", "EXPGS", "IMPGS"]
+quarterly_ids = ["GDPC1", "GPDIC1"]
+
+# Convert to quarterly
+gdp_q = to_quarterly_series(series_data["GDPC1"], "quarterly")
+gpdic1_q = to_quarterly_series(series_data["GPDIC1"], "quarterly") if "GPDIC1" in series_data else pd.Series(dtype=float)
+quarterly_monthly = {mid: to_quarterly_series(series_data[mid], "monthly") for mid in monthly_ids}
+
+# find common quarters intersection among GDP and monthly series (and GPDIC1)
+common_index = gdp_q.index
+for s in quarterly_monthly.values():
+    common_index = common_index.intersection(s.index)
+if not gpdic1_q.empty:
+    common_index = common_index.intersection(gpdic1_q.index)
+common_index = common_index.sort_values()
+if len(common_index) == 0:
+    raise ValueError("No overlapping quarters between GDP and monthly series. Check your CSVs / FRED key.")
+
+# Build combined quarterly dataframe
+df_q = pd.DataFrame(index=common_index)
+df_q["GDPC1"] = gdp_q.reindex(common_index)
+if not gpdic1_q.empty:
+    df_q["GPDIC1"] = gpdic1_q.reindex(common_index)
+for mid in monthly_ids:
+    df_q[mid] = quarterly_monthly[mid].reindex(common_index)
+
+print("\nCombined quarterly DataFrame (first/last rows):")
+display(df_q.head())
+display(df_q.tail())
+print("\nMissing values per series after alignment:")
+print(df_q.isna().sum())
+
+# -------------------------
+# Feature engineering (enhanced) including GPDIC1-derived features
+# -------------------------
+df = df_q.copy()
+
+# GDP level and growth features
+df["gdp_qoq_pct"] = df["GDPC1"].pct_change(1) * 100
+df["gdp_yoy_pct"] = df["GDPC1"].pct_change(4) * 100
+
+# GPDIC1 derived features if present
+if "GPDIC1" in df.columns:
+    df["gpdic1_qoq_pct"] = df["GPDIC1"].pct_change(1) * 100
+    df["gpdic1_yoy_pct"] = df["GPDIC1"].pct_change(4) * 100
+else:
+    df["gpdic1_qoq_pct"] = np.nan
+    df["gpdic1_yoy_pct"] = np.nan
+
+# CPI inflation
+df["inflation_qoq_pct"] = df["CPIAUCSL"].pct_change(1) * 100
+df["inflation_yoy_pct"] = df["CPIAUCSL"].pct_change(4) * 100
+
+# Rolling stats (3- and 4-quarter rolling means)
+roll_qs = [3, 4]
+rolling_sources = ["gdp_qoq_pct", "inflation_qoq_pct", "UNRATE", "DGS10", "CUSR0000SAH1", "FEDFUNDS", "EXPGS", "IMPGS", "gpdic1_qoq_pct"]
+for col in rolling_sources:
+    for r in roll_qs:
+        df[f"{col}_r{r}"] = df[col].rolling(r, min_periods=1).mean()
+
+# Create lag features (1 and 2 lags) for a comprehensive set including GPDIC1-derived
+lags = [1, 2]
+base_cols_for_lag = [
+    "gdp_qoq_pct", "inflation_qoq_pct", "UNRATE", "DGS10", "CUSR0000SAH1",
+    "FEDFUNDS", "EXPGS", "IMPGS", "gpdic1_qoq_pct", "gpdic1_yoy_pct",
+    "gdp_yoy_pct", "inflation_yoy_pct"
+]
+# include rolling columns in lag set
+for col in [f"{c}_r{r}" for c in rolling_sources for r in roll_qs]:
+    base_cols_for_lag.append(col)
+
+feature_cols = []
+for col in base_cols_for_lag:
+    for lag in lags:
+        cname = f"{col}_lag{lag}"
+        df[cname] = df[col].shift(lag)
+        feature_cols.append(cname)
+
+# Targets
+df["gdp_qoq_pct_next"] = df["gdp_qoq_pct"].shift(-1)
+df["GDPC1_next"] = df["GDPC1"].shift(-1)
+
+df_model = df[feature_cols + ["gdp_qoq_pct_next", "GDPC1_next"]].copy()
+print("\nNaN counts before imputation:")
+print(df_model.isna().sum())
+
+# -------------------------
+# Imputation
+# -------------------------
+df_imputed = df_model.copy()
+# linear interpolation and ffill/bfill
+df_imputed[feature_cols] = df_imputed[feature_cols].interpolate(method="linear", limit_direction="both", axis=0)
+df_imputed[feature_cols] = df_imputed[feature_cols].fillna(method="ffill").fillna(method="bfill")
+df_clean = df_imputed.dropna(subset=feature_cols + ["gdp_qoq_pct_next", "GDPC1_next"]).copy()
+
+print(f"\nRows after imputation and dropna: {len(df_clean)} (quarters from {df_clean.index.min().date()} to {df_clean.index.max().date()})")
+if len(df_clean) == 0:
+    raise ValueError("No usable rows after imputation/dropna. Cannot train.")
+
+# -------------------------
+# Train/Test split (time-ordered)
+# -------------------------
+test_size = 0.2
+n = len(df_clean)
+split_idx = int(np.floor((1 - test_size) * n))
+if split_idx < 1:
+    raise ValueError("Not enough rows to create train set after preprocessing. Try reducing test_size or lags.")
+train_df = df_clean.iloc[:split_idx].copy()
+test_df = df_clean.iloc[split_idx:].copy()
+print(f"\nTrain rows: {len(train_df)}, Test rows: {len(test_df)}")
+
+X_train = train_df[feature_cols]
+X_test = test_df[feature_cols]
+y_train_growth = train_df["gdp_qoq_pct_next"]
+y_test_growth = test_df["gdp_qoq_pct_next"]
+y_train_level = train_df["GDPC1_next"]
+y_test_level = test_df["GDPC1_next"]
+
+# -------------------------
+# Modeling helpers
+# -------------------------
+def tune_histgb(X, y, n_iter=20):
+    base = HistGradientBoostingRegressor(random_state=RANDOM_STATE)
+    param_dist = {
+        "learning_rate": [0.01, 0.03, 0.05, 0.1],
+        "max_iter": [100, 300, 600],
+        "max_depth": [3, 5, None],
+        "min_samples_leaf": [5, 10, 20],
+        "l2_regularization": [0.0, 0.1, 0.5]
+    }
+    tscv = TimeSeriesSplit(n_splits=4)
+    rs = RandomizedSearchCV(base, param_dist, n_iter=n_iter, cv=tscv, scoring="neg_mean_squared_error",
+                            random_state=RANDOM_STATE, n_jobs=-1, verbose=0)
+    rs.fit(X, y)
+    best = rs.best_estimator_
+    return best, rs
+
+def train_simple_ridge(X, y):
+    pipe = Pipeline([("scaler", StandardScaler()), ("ridge", Ridge(alpha=1.0, random_state=RANDOM_STATE))])
+    pipe.fit(X, y)
+    return pipe
+
+def fit_and_ensemble(X_tr, y_tr, n_iter=20):
+    best_histgb, rs = tune_histgb(X_tr, y_tr, n_iter=n_iter)
+    ridge = train_simple_ridge(X_tr, y_tr)
+    return best_histgb, ridge, rs
+
+# -------------------------
+# Train models for both targets
+# -------------------------
+print("\nTuning & training model for next-quarter GDP growth (%) ...")
+hist_grow, ridge_grow, rs_grow = fit_and_ensemble(X_train, y_train_growth, n_iter=20)
+
+print("Tuning & training model for next-quarter GDP level (GDPC1) ...")
+hist_level, ridge_level, rs_level = fit_and_ensemble(X_train, y_train_level, n_iter=20)
+
+def ensemble_predict(hist_model, ridge_model, X):
+    p1 = hist_model.predict(X)
+    p2 = ridge_model.predict(X)
+    return 0.6 * p1 + 0.4 * p2
+
+y_pred_train_g = ensemble_predict(hist_grow, ridge_grow, X_train)
+y_pred_test_g = ensemble_predict(hist_grow, ridge_grow, X_test)
+y_pred_train_l = ensemble_predict(hist_level, ridge_level, X_train)
+y_pred_test_l = ensemble_predict(hist_level, ridge_level, X_test)
+
+# -------------------------
+# Evaluation - QoQ and Annualized
+# -------------------------
+def metrics(y_true, y_pred):
+    return {"r2": r2_score(y_true, y_pred), "rmse": rmse(y_true, y_pred)}
+
+metrics_g_train = metrics(y_train_growth, y_pred_train_g)
+metrics_g_test = metrics(y_test_growth, y_pred_test_g)
+metrics_l_train = metrics(y_train_level, y_pred_train_l)
+metrics_l_test = metrics(y_test_level, y_pred_test_l)
+
+# Annualize actual and predicted QoQ for evaluation
+y_train_g_annual = annualize_qoq_pct(y_train_growth.values)
+y_pred_train_g_annual = annualize_qoq_pct(y_pred_train_g)
+y_test_g_annual = annualize_qoq_pct(y_test_growth.values)
+y_pred_test_g_annual = annualize_qoq_pct(y_pred_test_g)
+
+metrics_g_train_annual = metrics(y_train_g_annual, y_pred_train_g_annual)
+metrics_g_test_annual = metrics(y_test_g_annual, y_pred_test_g_annual)
+
+print("\nEvaluation - Next-quarter GDP growth (QoQ %)")
+print(f" Train R²: {metrics_g_train['r2']:.4f}, RMSE: {metrics_g_train['rmse']:.4f}")
+print(f" Test  R²: {metrics_g_test['r2']:.4f}, RMSE: {metrics_g_test['rmse']:.4f}")
+
+print("\nEvaluation - Next-quarter GDP growth (Annualized %)")
+print(f" Train R²: {metrics_g_train_annual['r2']:.4f}, RMSE: {metrics_g_train_annual['rmse']:.4f}")
+print(f" Test  R²: {metrics_g_test_annual['r2']:.4f}, RMSE: {metrics_g_test_annual['rmse']:.4f}")
+
+print("\nEvaluation - Next-quarter GDP level (GDPC1)")
+print(f" Train R²: {metrics_l_train['r2']:.4f}, RMSE: {metrics_l_train['rmse']:.4f}")
+print(f" Test  R²: {metrics_l_test['r2']:.4f}, RMSE: {metrics_l_test['rmse']:.4f}")
+
+# -------------------------
+# Plot actual vs predicted (QoQ, Annualized, Level)
+# -------------------------
+def plot_series_compare(dates, actual, predicted, title, ylabel):
+    plt.figure(figsize=(10, 5))
+    plt.plot(dates, actual, label="Actual", marker="o")
+    plt.plot(dates, predicted, label="Predicted", marker="o")
+    plt.title(title)
+    plt.xlabel("Quarter")
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+if len(X_test) > 0:
+    plot_series_compare(test_df.index, y_test_growth.values, y_pred_test_g, "Actual vs Predicted Next-Q GDP Growth (%)", "QoQ %")
+    plot_series_compare(test_df.index, y_test_g_annual, y_pred_test_g_annual, "Actual vs Predicted Next-Q GDP Growth (Annualized %)", "Annualized %")
+    plot_series_compare(test_df.index, y_test_level.values, y_pred_test_l, "Actual vs Predicted Next-Q GDPC1 Level", "GDPC1")
+
+    # scatter plots
+    plt.figure(figsize=(6,6))
+    plt.scatter(y_test_growth, y_pred_test_g, alpha=0.8)
+    mn = min(np.nanmin(y_test_growth.values), np.nanmin(y_pred_test_g))
+    mx = max(np.nanmax(y_test_growth.values), np.nanmax(y_pred_test_g))
+    plt.plot([mn, mx], [mn, mx], 'k--', alpha=0.6)
+    plt.xlabel("Actual QoQ %")
+    plt.ylabel("Predicted QoQ %")
+    plt.title("Predicted vs Actual (QoQ growth) - Test")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(6,6))
+    plt.scatter(y_test_g_annual, y_pred_test_g_annual, alpha=0.8)
+    mn = min(np.nanmin(y_test_g_annual), np.nanmin(y_pred_test_g_annual))
+    mx = max(np.nanmax(y_test_g_annual), np.nanmax(y_pred_test_g_annual))
+    plt.plot([mn, mx], [mn, mx], 'k--', alpha=0.6)
+    plt.xlabel("Actual Annualized %")
+    plt.ylabel("Predicted Annualized %")
+    plt.title("Predicted vs Actual (Annualized growth) - Test")
+    plt.tight_layout()
+    plt.show()
+
+# -------------------------
+# Last-quarter values and next-quarter predictions (QoQ, Annualized, Level), include GPDIC1 if present
+# -------------------------
+latest_row = df_clean.iloc[-1]
+latest_quarter = df_clean.index[-1]
+print(f"\nLatest modeling quarter used: {latest_quarter.date()}")
+
+display_cols = ["GDPC1", "GPDIC1", "gdp_qoq_pct", "gdp_yoy_pct", "gpdic1_qoq_pct", "gpdic1_yoy_pct",
+                "inflation_qoq_pct", "UNRATE", "DGS10", "CUSR0000SAH1", "FEDFUNDS", "EXPGS", "IMPGS"]
+# Filter display_cols to those present in df
+display_cols = [c for c in display_cols if c in df.columns]
+print("\nLast-quarter key values:")
+display(df.loc[latest_quarter, display_cols].to_frame(name="value"))
+
+X_last = latest_row[feature_cols].to_frame().T
+pred_growth_qoq = ensemble_predict(hist_grow, ridge_grow, X_last)[0]
+pred_growth_annual = annualize_qoq_pct(pred_growth_qoq)
+pred_level_direct = ensemble_predict(hist_level, ridge_level, X_last)[0]
+pred_level_via_growth = df.loc[latest_quarter, "GDPC1"] * (1.0 + pred_growth_qoq / 100.0)
+
+print(f"\nPredicted next-quarter GDP growth (QoQ %): {pred_growth_qoq:.3f}%")
+print(f"Predicted next-quarter GDP growth (Annualized %): {pred_growth_annual:.3f}%")
+print(f"Predicted next-quarter GDPC1 (direct model): {pred_level_direct:.3f}")
+print(f"Predicted next-quarter GDPC1 (via growth): {pred_level_via_growth:.3f}")
+
+# -------------------------
+# Feature importances (growth model)
+# -------------------------
+try:
+    imp = hist_grow.feature_importances_
+    fi = pd.DataFrame({"feature": feature_cols, "importance": imp}).sort_values("importance", ascending=False).reset_index(drop=True)
+    print("\nTop features (growth model):")
+    display(fi.head(30))
+    topn = min(30, len(fi))
+    plt.figure(figsize=(8, max(4, 0.2 * topn)))
+    plt.barh(fi["feature"].iloc[:topn][::-1], fi["importance"].iloc[:topn][::-1], color="tab:blue", edgecolor="black")
+    plt.title("Feature importances (growth model) - top features")
+    plt.tight_layout()
+    plt.show()
+except Exception as e:
+    print("Could not extract feature importances:", e)
+
+# -------------------------
+# Optional: save models
+# -------------------------
+# import joblib
+# joblib.dump(hist_grow, DATA_DIR / "histgb_growth_model_with_extra_series.joblib")
+# joblib.dump(ridge_grow, DATA_DIR / "ridge_growth_model_with_extra_series.joblib")
+# joblib.dump(hist_level, DATA_DIR / "histgb_level_model_with_extra_series.joblib")
+# joblib.dump(ridge_level, DATA_DIR / "ridge_level_model_with_extra_series.joblib")
+# print("Saved models to DATA_DIR")
+
+# End of script.
