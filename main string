@@ -1,7 +1,4 @@
-# Jupyter-ready script: predict next-quarter GDP growth and level, plus annualized growth
-# Now includes additional FRED series: FEDFUNDS, EXPGS, IMPGS, and GPDIC1
-# No seaborn dependency.
-#
+
 # Requirements: pandas, numpy, matplotlib, scikit-learn, requests
 # pip install pandas numpy matplotlib scikit-learn requests
 
